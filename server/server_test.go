@@ -2460,7 +2460,7 @@ func TestServerAcceptConnection(t *testing.T) {
 			return
 		}
 
-		hConn := hijackConn{
+		hConn := &hijackConn{
 			Conn: conn,
 			buf:  buf.Reader,
 		}
@@ -2537,11 +2537,11 @@ type hijackConn struct {
 	buf *bufio.Reader
 }
 
-var _ net.Conn = hijackConn{}
+var _ net.Conn = &hijackConn{}
 
 // Read implements [net.Conn]. It reads from the buffer first, then the
 // underlying connection.
-func (h hijackConn) Read(b []byte) (n int, err error) {
+func (h *hijackConn) Read(b []byte) (n int, err error) {
 	if h.buf != nil {
 		if h.buf.Buffered() > 0 {
 			return h.buf.Read(b)
