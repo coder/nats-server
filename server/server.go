@@ -2859,6 +2859,22 @@ func (s *Server) InProcessConn() (net.Conn, error) {
 	return pr, nil
 }
 
+// AcceptConnection registers a connection to be handled by the server,
+// bypassing the internal TCP listener. This can be used regardless of the state
+// of the DontListen option.
+//
+// The useTLS flag denotes whether this connection should use TLS if the server
+// is configured to do so.
+func (s *Server) AcceptConnection(conn net.Conn, useTLS bool) error {
+	if !s.startGoRoutine(func() {
+		s.createClientEx(conn, !useTLS)
+		s.grWG.Done()
+	}) {
+		return fmt.Errorf("failed to create client")
+	}
+	return nil
+}
+
 func (s *Server) acceptConnections(l net.Listener, acceptName string, createFunc func(conn net.Conn), errFunc func(err error) bool) {
 	tmpDelay := ACCEPT_MIN_SLEEP
 

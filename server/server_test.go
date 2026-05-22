@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
@@ -2419,4 +2421,179 @@ func TestBuildinfoFormatRevision(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServerAcceptConnection tests running a server behind a HTTP upgrade, with
+// the client dialing it using a custom net.Dialer.
+func TestServerAcceptConnection(t *testing.T) {
+	t.Parallel()
+
+	srv := RunServer(&Options{
+		DontListen: true,
+	})
+	defer srv.Shutdown()
+
+	const proto = "nats"
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Connection") != "upgrade" || r.Header.Get("Upgrade") != proto {
+			http.Error(w, "invalid upgrade request", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Add("Connection", "upgrade")
+		w.Header().Add("Upgrade", proto)
+		w.WriteHeader(http.StatusSwitchingProtocols)
+
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "cannot upgrade, ResponseWriter is not Hijacker", http.StatusInternalServerError)
+			return
+		}
+		conn, buf, err := hijacker.Hijack()
+		if err != nil {
+			http.Error(w, "upgrade failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		err = conn.SetDeadline(time.Time{})
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+
+		hConn := hijackConn{
+			Conn: conn,
+			buf:  buf.Reader,
+		}
+		err = srv.AcceptConnection(hConn, true)
+		if err != nil {
+			_ = conn.Close()
+			return
+		}
+	}))
+	defer httpSrv.Close()
+
+	dialer := customDialer{
+		dialFunc: func(network, address string) (net.Conn, error) {
+			req, err := http.NewRequest("GET", httpSrv.URL, nil)
+			if err != nil {
+				return nil, fmt.Errorf("create request: %+v", err)
+			}
+
+			req.Header.Set("Connection", "upgrade")
+			req.Header.Set("Upgrade", proto)
+
+			client := &http.Client{
+				Timeout: 0,
+				Transport: &http.Transport{
+					// Important for Upgrade-style protocols: avoid HTTP/2 here.
+					ForceAttemptHTTP2: false,
+				},
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, fmt.Errorf("do request: %+v", err)
+			}
+
+			if resp.StatusCode != http.StatusSwitchingProtocols {
+				_ = resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+				return nil, fmt.Errorf("upgrade failed: status=%s body=%q", resp.Status, body)
+			}
+
+			w, ok := resp.Body.(io.Writer)
+			if !ok {
+				return nil, fmt.Errorf("could not get ReadWriteCloser from response body")
+			}
+
+			return readWriteCloserConn{
+				ReadWriteCloser: struct {
+					io.Reader
+					io.Writer
+					io.Closer
+				}{
+					Reader: resp.Body,
+					Writer: w,
+					Closer: resp.Body,
+				},
+				localAddr:  &net.TCPAddr{},
+				remoteAddr: &net.TCPAddr{},
+			}, nil
+		},
+	}
+
+	client, err := nats.Connect("doesnotmatter", nats.SetCustomDialer(dialer))
+	if err != nil {
+		t.Fatalf("client failed to connect: %+v", err)
+	}
+
+	if client.ConnectedServerVersion() != srv.info.Version {
+		t.Fatalf("client detected server version does not match")
+	}
+}
+
+type hijackConn struct {
+	net.Conn
+	buf *bufio.Reader
+}
+
+var _ net.Conn = hijackConn{}
+
+// Read implements [net.Conn]. It reads from the buffer first, then the
+// underlying connection.
+func (h hijackConn) Read(b []byte) (n int, err error) {
+	if h.buf != nil {
+		if h.buf.Buffered() > 0 {
+			return h.buf.Read(b)
+		}
+		h.buf = nil
+	}
+
+	return h.Conn.Read(b)
+}
+
+type customDialer struct {
+	dialFunc func(network, address string) (net.Conn, error)
+}
+
+var _ nats.CustomDialer = customDialer{}
+
+func (d customDialer) Dial(network, address string) (net.Conn, error) {
+	return d.dialFunc(network, address)
+}
+
+type readWriteCloserConn struct {
+	io.ReadWriteCloser
+	localAddr  net.Addr
+	remoteAddr net.Addr
+}
+
+var _ net.Conn = readWriteCloserConn{}
+
+// LocalAddr implements [net.Conn].
+func (c readWriteCloserConn) LocalAddr() net.Addr {
+	return c.localAddr
+}
+
+// RemoteAddr implements [net.Conn].
+func (c readWriteCloserConn) RemoteAddr() net.Addr {
+	return c.remoteAddr
+}
+
+// SetDeadline implements [net.Conn].
+func (readWriteCloserConn) SetDeadline(t time.Time) error {
+	// Unimplemented.
+	return nil
+}
+
+// SetReadDeadline implements [net.Conn].
+func (r readWriteCloserConn) SetReadDeadline(t time.Time) error {
+	// Unimplemented.
+	return nil
+}
+
+// SetWriteDeadline implements [net.Conn].
+func (r readWriteCloserConn) SetWriteDeadline(t time.Time) error {
+	// Unimplemented.
+	return nil
 }
